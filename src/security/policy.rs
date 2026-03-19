@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use super::prompt_guard::{GuardAction, PromptGuard};
+
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -92,6 +94,7 @@ pub struct SecurityPolicy {
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
     pub tracker: ActionTracker,
+    pub prompt_guard: Option<PromptGuard>,
 }
 
 /// Default allowed commands for Unix platforms.
@@ -201,6 +204,7 @@ impl Default for SecurityPolicy {
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
             tracker: ActionTracker::new(),
+            prompt_guard: None,
         }
     }
 }
@@ -1362,6 +1366,14 @@ impl SecurityPolicy {
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             tracker: ActionTracker::new(),
+            prompt_guard: if autonomy_config.prompt_guard.enabled {
+                Some(PromptGuard::with_config(
+                    GuardAction::from_str(&autonomy_config.prompt_guard.action),
+                    autonomy_config.prompt_guard.sensitivity,
+                ))
+            } else {
+                None
+            },
         }
     }
 }

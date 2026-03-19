@@ -4267,6 +4267,25 @@ pub async fn process_message(
         format!("{context}[{now}] {message}")
     };
 
+    if let Some(ref guard) = security.prompt_guard {
+        match guard.scan(&enriched) {
+            crate::security::GuardResult::Blocked(reason) => {
+                tracing::warn!("Blocked prompt injection attempt: {reason}");
+                return Err(anyhow::anyhow!(
+                    "Message blocked: potential prompt injection detected"
+                ));
+            }
+            crate::security::GuardResult::Suspicious(patterns, score) => {
+                tracing::warn!(
+                    "Suspicious prompt patterns detected (score {:.2}): {}",
+                    score,
+                    patterns.join(", ")
+                );
+            }
+            crate::security::GuardResult::Safe => {}
+        }
+    }
+
     let mut history = vec![
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),

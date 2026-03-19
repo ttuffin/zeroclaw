@@ -3658,6 +3658,33 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Prompt injection guard configuration.
+    #[serde(default)]
+    pub prompt_guard: PromptGuardConfig,
+}
+
+/// Configuration for prompt injection detection.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct PromptGuardConfig {
+    /// Enable prompt injection detection. Default: false (off by default).
+    pub enabled: bool,
+    /// Action when injection detected: "warn" (log only), "block" (reject message).
+    /// Default: "warn".
+    pub action: String,
+    /// Sensitivity threshold (0.0-1.0, higher = more strict). Default: 0.7.
+    pub sensitivity: f64,
+}
+
+impl Default for PromptGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            action: "warn".to_string(),
+            sensitivity: 0.7,
+        }
+    }
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -3726,6 +3753,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            prompt_guard: PromptGuardConfig::default(),
         }
     }
 }
@@ -8563,6 +8591,7 @@ default_temperature = 0.7
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                prompt_guard: PromptGuardConfig::default(),
             },
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
