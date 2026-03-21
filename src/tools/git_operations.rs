@@ -528,6 +528,16 @@ impl GitOperationsTool {
         }
     }
 
+    fn extract_destination_from_url(url: &str) -> String {
+        url.trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or("repo")
+            .trim_end_matches(".git")
+            .to_string()
+    }
+
     async fn git_clone(
         &self,
         args: serde_json::Value,
@@ -563,17 +573,11 @@ impl GitOperationsTool {
             });
         }
 
-        let destination = args
-            .get("destination")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                sanitized_url
-                    .trim_end_matches('/')
-                    .split('/')
-                    .find(|s| !s.is_empty())
-                    .unwrap_or("repo")
-                    .trim_end_matches(".git")
-            });
+        let destination = if let Some(d) = args.get("destination").and_then(|v| v.as_str()) {
+            d.to_string()
+        } else {
+            Self::extract_destination_from_url(sanitized_url.as_str())
+        };
 
         if destination.starts_with('.') || destination.starts_with('~') {
             return Ok(ToolResult {
@@ -583,7 +587,7 @@ impl GitOperationsTool {
             });
         }
 
-        let target_dir = cwd.join(destination);
+        let target_dir = cwd.join(&destination);
         if target_dir.exists() {
             return Ok(ToolResult {
                 success: false,
@@ -593,7 +597,7 @@ impl GitOperationsTool {
         }
 
         let output = self
-            .run_git_command(&["clone", &sanitized_url, destination], cwd)
+            .run_git_command(&["clone", &sanitized_url, &destination], cwd)
             .await;
 
         match output {
@@ -1019,6 +1023,26 @@ mod tests {
         assert!(tool.sanitize_git_args("--cached").is_ok());
         assert!(tool.sanitize_git_args("src/main.rs").is_ok());
         assert!(tool.sanitize_git_args(".").is_ok());
+    }
+
+    #[test]
+    fn clone_extracts_destination_from_url() {
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com/org/repo"),
+            "repo"
+        );
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com/org/repo/"),
+            "repo"
+        );
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com/org/repo.git"),
+            "repo"
+        );
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com/org/repo.git/"),
+            "repo"
+        );
     }
 
     #[test]
