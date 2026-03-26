@@ -5627,8 +5627,11 @@ pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
     /// Matrix access token for the bot account.
-    pub access_token: String,
+    /// Optional when `password` is set (bot will login and obtain a token automatically).
+    #[serde(default)]
+    pub access_token: Option<String>,
     /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
+    /// Required when using password-based login without access_token.
     #[serde(default)]
     pub user_id: Option<String>,
     /// Optional Matrix device ID.
@@ -5645,6 +5648,11 @@ pub struct MatrixConfig {
     /// Whether to interrupt an in-flight agent response when a new message arrives.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Optional Matrix account password. When set, the bot will:
+    /// - Login automatically if no access_token is configured (simplest setup).
+    /// - Bootstrap cross-signing so the device is marked as "verified by its owner".
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -7855,6 +7863,19 @@ impl Config {
                 decrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
             }
 
+            if let Some(ref mut matrix) = config.channels_config.matrix {
+                decrypt_optional_secret(
+                    &store,
+                    &mut matrix.access_token,
+                    "config.channels_config.matrix.access_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut matrix.password,
+                    "config.channels_config.matrix.password",
+                )?;
+            }
+
             // Decrypt nested STT provider API keys
             decrypt_optional_secret(
                 &store,
@@ -7948,13 +7969,6 @@ impl Config {
                     &store,
                     &mut mm.bot_token,
                     "config.channels_config.mattermost.bot_token",
-                )?;
-            }
-            if let Some(ref mut mx) = config.channels_config.matrix {
-                decrypt_secret(
-                    &store,
-                    &mut mx.access_token,
-                    "config.channels_config.matrix.access_token",
                 )?;
             }
             if let Some(ref mut wa) = config.channels_config.whatsapp {
@@ -8512,45 +8526,6 @@ impl Config {
             }
         }
 
-        // Microsoft 365
-        if self.microsoft365.enabled {
-            let tenant = self
-                .microsoft365
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if tenant.is_none() {
-                anyhow::bail!(
-                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let client = self
-                .microsoft365
-                .client_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if client.is_none() {
-                anyhow::bail!(
-                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let flow = self.microsoft365.auth_flow.trim();
-            if flow != "client_credentials" && flow != "device_code" {
-                anyhow::bail!("microsoft365.auth_flow must be client_credentials or device_code");
-            }
-            if flow == "client_credentials"
-                && self
-                    .microsoft365
-                    .client_secret
-                    .as_deref()
-                    .map_or(true, |s| s.trim().is_empty())
-            {
-                anyhow::bail!("microsoft365.client_secret must not be empty when auth_flow is client_credentials");
-            }
-        }
-
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
@@ -8716,6 +8691,28 @@ impl Config {
                 if !path.exists() {
                     anyhow::bail!("project_intel.templates_dir path does not exist: {tpl_dir}");
                 }
+            }
+        }
+
+        // Matrix: password-only login requires user_id
+        if let Some(ref matrix) = self.channels_config.matrix {
+            let has_access_token = matrix
+                .access_token
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_password = matrix
+                .password
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_user_id = matrix
+                .user_id
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+
+            if has_password && !has_access_token && !has_user_id {
+                anyhow::bail!(
+                    "channels_config.matrix.user_id is required when password is set and access_token is omitted"
+                );
             }
         }
 
@@ -9303,6 +9300,19 @@ impl Config {
             encrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
         }
 
+        if let Some(ref mut matrix) = config_to_save.channels_config.matrix {
+            encrypt_optional_secret(
+                &store,
+                &mut matrix.access_token,
+                "config.channels_config.matrix.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut matrix.password,
+                "config.channels_config.matrix.password",
+            )?;
+        }
+
         // Encrypt nested STT provider API keys
         encrypt_optional_secret(
             &store,
@@ -9396,13 +9406,6 @@ impl Config {
                 &store,
                 &mut mm.bot_token,
                 "config.channels_config.mattermost.bot_token",
-            )?;
-        }
-        if let Some(ref mut mx) = config_to_save.channels_config.matrix {
-            encrypt_secret(
-                &store,
-                &mut mx.access_token,
-                "config.channels_config.matrix.access_token",
             )?;
         }
         if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
@@ -10969,18 +10972,19 @@ default_temperature = 0.7
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
             homeserver: "https://matrix.org".into(),
-            access_token: "syt_token_abc".into(),
+            access_token: Some("syt_token_abc".to_string()),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            password: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.homeserver, "https://matrix.org");
-        assert_eq!(parsed.access_token, "syt_token_abc");
+        assert_eq!(parsed.access_token.as_deref(), Some("syt_token_abc"));
         assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
         assert_eq!(parsed.room_id, "!room123:matrix.org");
@@ -10991,13 +10995,14 @@ default_temperature = 0.7
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
             homeserver: "https://synapse.local:8448".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".to_string()),
             user_id: None,
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            password: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -11085,13 +11090,14 @@ allowed_users = ["@ops:matrix.org"]
             }),
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
-                access_token: "tok".into(),
+                access_token: Some("tok".to_string()),
                 user_id: None,
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                password: None,
             }),
             signal: None,
             whatsapp: None,

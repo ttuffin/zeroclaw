@@ -886,13 +886,14 @@ mod tests {
         let mut config = Config::default();
         config.channels_config.matrix = Some(MatrixConfig {
             homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".to_string()),
             user_id: None,
             device_id: None,
             room_id: "!r:m".into(),
             allowed_users: vec![],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            password: None,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
