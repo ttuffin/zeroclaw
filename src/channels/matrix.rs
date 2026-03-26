@@ -10,7 +10,6 @@ use matrix_sdk::{
     ruma::{
         api::client::receipt::create_receipt,
         api::client::uiaa,
-        events::reaction::ReactionEventContent,
         events::receipt::ReceiptThread,
         events::relation::{Annotation, Thread},
         events::room::member::StrippedRoomMemberEvent,
