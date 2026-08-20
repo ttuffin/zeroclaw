@@ -1,10 +1,19 @@
+use crate::helpers::domain_guard;
 use async_trait::async_trait;
+use reqwest::Url;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
+
+/// Default timeout for network-backed git operations (clone, pull, fetch).
+const NETWORK_GIT_TIMEOUT_SECS: u64 = 120;
+
+const TOOL_DESCRIPTION_KEY: &str = "tool-git-operations";
+static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
@@ -55,7 +64,15 @@ impl GitOperationsTool {
     fn requires_write_access(&self, operation: &str) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "stash" | "reset" | "revert" | "worktree"
+            "commit"
+                | "add"
+                | "checkout"
+                | "stash"
+                | "reset"
+                | "revert"
+                | "worktree"
+                | "clone"
+                | "pull"
         )
     }
 
@@ -63,7 +80,7 @@ impl GitOperationsTool {
     fn is_read_only(&self, operation: &str) -> bool {
         matches!(
             operation,
-            "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
+            "status" | "diff" | "log" | "show" | "branch" | "rev-parse" | "fetch"
         )
     }
 
@@ -122,6 +139,227 @@ impl GitOperationsTool {
         } else {
             self.workspace_dir.join(raw)
         })
+    }
+
+    /// Validate a git remote name against a strict allowlist. Rejects option
+    /// injection (`--all`, `--delete`) and shell metacharacters.
+    fn validate_remote_name<'a>(&self, remote: &'a str) -> anyhow::Result<&'a str> {
+        if remote.is_empty() {
+            anyhow::bail!("remote name cannot be empty");
+        }
+        let mut chars = remote.chars();
+        let first = chars.next().unwrap();
+        if !(first.is_ascii_alphanumeric() || first == '_') {
+            anyhow::bail!(
+                "remote name '{}' must start with a letter, digit, or '_'",
+                remote
+            );
+        }
+        if !remote
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            anyhow::bail!("remote name '{}' contains invalid characters", remote);
+        }
+        Ok(remote)
+    }
+
+    /// Validate a branch, revision, or commit-ish value. Rejects leading `-`
+    /// (git option injection, e.g. `git diff --output=...`), whitespace, and
+    /// control characters.
+    fn validate_revision<'a>(&self, rev: &'a str) -> anyhow::Result<&'a str> {
+        if rev.is_empty() {
+            anyhow::bail!("revision cannot be empty");
+        }
+        if rev.starts_with('-') {
+            anyhow::bail!("revision '{}' must not start with '-'", rev);
+        }
+        if rev.chars().any(char::is_whitespace)
+            || rev.chars().any(|c| c.is_control())
+            || rev.contains('|')
+            || rev.contains(';')
+            || rev.contains('`')
+        {
+            anyhow::bail!("revision '{}' contains invalid characters", rev);
+        }
+        Ok(rev)
+    }
+
+    /// Validate a clone destination directory name. Single path component only;
+    /// rejects traversal, absolute paths, hidden/`~`/`-` prefixes, and
+    /// separators so the resolved target cannot escape the workspace.
+    fn validate_destination_component<'a>(&self, dest: &'a str) -> anyhow::Result<&'a str> {
+        if dest.is_empty() {
+            anyhow::bail!("destination cannot be empty");
+        }
+        if dest == "." || dest == ".." {
+            anyhow::bail!("destination cannot be '.' or '..'");
+        }
+        if dest.starts_with('.') || dest.starts_with('~') || dest.starts_with('-') {
+            anyhow::bail!(
+                "destination cannot start with '.', '~', or '-' (got '{}')",
+                dest
+            );
+        }
+        if dest.contains(['/', '\\', '\0']) || dest.chars().any(char::is_whitespace) {
+            anyhow::bail!("destination '{}' must be a single directory name", dest);
+        }
+        Ok(dest)
+    }
+
+    /// Validate a clone URL: https-only, no embedded credentials, and the host
+    /// must be globally routable (SSRF guard). Returns the normalized URL.
+    fn validate_clone_url(&self, url: &str) -> anyhow::Result<String> {
+        let url = url.trim();
+        if url.is_empty() {
+            anyhow::bail!("clone URL cannot be empty");
+        }
+        if url.chars().any(char::is_whitespace) {
+            anyhow::bail!("clone URL cannot contain whitespace");
+        }
+        let parsed = Url::parse(url).map_err(|_| anyhow::anyhow!("invalid clone URL"))?;
+        if parsed.scheme() != "https" {
+            anyhow::bail!("only https:// clone URLs are allowed");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("clone URL must not contain embedded credentials");
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("clone URL must include a host"))?;
+        if let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && domain_guard::is_cloud_metadata_ip(ip)
+        {
+            anyhow::bail!("blocked cloud metadata clone host: {host}");
+        }
+        if domain_guard::is_private_or_local_host(host) {
+            anyhow::bail!("blocked local/private clone host: {host}");
+        }
+        Ok(parsed.to_string())
+    }
+
+    /// Derive a safe destination directory name from a validated clone URL's
+    /// final path segment (stripping a trailing `.git`).
+    fn extract_destination_from_url(url: &str) -> String {
+        let parsed = Url::parse(url).expect("clone URL was already validated");
+        let last = parsed
+            .path()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .next_back()
+            .unwrap_or("");
+        let name = last.trim_end_matches(".git");
+        if name.is_empty() || name == "." || name == ".." {
+            "repo".to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Resolve the clone target directory. `parent` (the 'path' parameter) is
+    /// the existing parent directory the clone is created under; `destination`
+    /// is a validated single directory component. The target must not exist.
+    fn resolve_clone_target(
+        &self,
+        parent: Option<&str>,
+        destination: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let base = self.resolve_working_dir(parent)?;
+        let target = base.join(destination);
+        if target.exists() {
+            anyhow::bail!("destination already exists: {}", target.display());
+        }
+        Ok(target)
+    }
+
+    /// Run a network-backed git operation with a scrubbed environment.
+    ///
+    /// Clears the process environment and re-adds only what is needed so the
+    /// user's ambient git configuration and credentials cannot reach the remote
+    /// (mirrors the shell tool's CWE-200 env hygiene): no credential helpers,
+    /// no `GIT_ASKPASS`, no `url.*.insteadOf` rewrites, no smudge/clean filter
+    /// commands from global config. System/global gitconfig is disabled and
+    /// `safe.directory` is set explicitly for the working directory. A timeout
+    /// bounds hung or malicious servers.
+    async fn run_network_git_command(
+        &self,
+        args: &[&str],
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<String> {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.current_dir(working_dir)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_default())
+            .env("TEMP", std::env::var("TEMP").unwrap_or_default())
+            .env("TMP", std::env::var("TMP").unwrap_or_default())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null());
+        // `-c safe.directory=...` must precede the subcommand so a workspace
+        // repo owned by another UID still works without the user's global config.
+        cmd.arg("-c")
+            .arg(format!("safe.directory={}", working_dir.display()))
+            .args(args);
+        // Proxy variables are operator-controlled (not model- or remote-
+        // controlled) and required for corporate networks, so keep them.
+        for proxy in [
+            "http_proxy",
+            "https_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ] {
+            if let Ok(value) = std::env::var(proxy) {
+                cmd.env(proxy, value);
+            }
+        }
+
+        let output =
+            tokio::time::timeout(Duration::from_secs(NETWORK_GIT_TIMEOUT_SECS), cmd.output())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "git network operation timed out after {NETWORK_GIT_TIMEOUT_SECS} seconds"
+                    )
+                })??;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Git command failed: {stderr}");
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn result_success(message: String) -> ToolResult {
+        ToolResult {
+            success: true,
+            output: message.into(),
+            error: None,
+        }
+    }
+
+    fn result_failure(message: String) -> ToolResult {
+        ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(message),
+        }
+    }
+
+    /// Localized tool error text (fixed key).
+    fn ferr(key: &str) -> String {
+        crate::i18n::get_required_tool_string(key)
+    }
+
+    /// Localized tool error text with Fluent `{ $name }` interpolation.
+    fn ferr_args(key: &str, args: &[(&str, &str)]) -> String {
+        crate::i18n::get_required_tool_string_with_args(key, args)
     }
 
     fn ensure_worktree_add_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
@@ -296,6 +534,11 @@ impl GitOperationsTool {
         if cached {
             git_args.push("--cached");
         }
+        if let Some(commit) = args.get("commit").and_then(|v| v.as_str())
+            && !commit.is_empty()
+        {
+            git_args.push(self.validate_revision(commit)?);
+        }
         git_args.push("--");
         git_args.push(files);
 
@@ -408,23 +651,224 @@ impl GitOperationsTool {
         })
     }
 
-    async fn git_branch(
+    async fn git_clone(
         &self,
-        _args: serde_json::Value,
+        args: serde_json::Value,
         working_dir: &std::path::Path,
     ) -> anyhow::Result<ToolResult> {
-        let output = self
-            .run_git_command(
+        let url = match args.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u,
+            None => {
+                return Ok(Self::result_failure(Self::ferr(
+                    "tool-git-operations-error-clone-missing-url",
+                )));
+            }
+        };
+
+        let validated_url = match self.validate_clone_url(url) {
+            Ok(u) => u,
+            Err(e) => {
+                return Ok(Self::result_failure(Self::ferr_args(
+                    "tool-git-operations-error-clone-url",
+                    &[("reason", &format!("{e}"))],
+                )));
+            }
+        };
+
+        let destination = match args.get("destination").and_then(|v| v.as_str()) {
+            Some(d) => match self.validate_destination_component(d) {
+                Ok(d) => d.to_string(),
+                Err(e) => {
+                    return Ok(Self::result_failure(Self::ferr_args(
+                        "tool-git-operations-error-clone-destination",
+                        &[("reason", &format!("{e}"))],
+                    )));
+                }
+            },
+            None => Self::extract_destination_from_url(&validated_url),
+        };
+
+        let target = match self
+            .resolve_clone_target(args.get("path").and_then(|v| v.as_str()), &destination)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(Self::result_failure(Self::ferr_args(
+                    "tool-git-operations-error-clone-destination",
+                    &[("reason", &format!("{e}"))],
+                )));
+            }
+        };
+        let target_str = match target.to_str() {
+            Some(s) => s,
+            None => {
+                return Ok(Self::result_failure(Self::ferr_args(
+                    "tool-git-operations-error-clone-destination",
+                    &[("reason", "path is not valid UTF-8")],
+                )));
+            }
+        };
+
+        let mut git_args: Vec<String> = vec!["clone".into()];
+        if let Some(depth) = args.get("depth").and_then(|v| v.as_u64()) {
+            if depth == 0 {
+                return Ok(Self::result_failure(Self::ferr(
+                    "tool-git-operations-error-clone-depth",
+                )));
+            }
+            git_args.push("--depth".into());
+            git_args.push(depth.to_string());
+        }
+        git_args.push(validated_url.clone());
+        git_args.push(target_str.to_string());
+
+        let git_args_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+        match self
+            .run_network_git_command(&git_args_refs, working_dir)
+            .await
+        {
+            Ok(_) => Ok(Self::result_success(format!(
+                "Cloned {} to {}",
+                validated_url,
+                target.display()
+            ))),
+            Err(e) => Ok(Self::result_failure(Self::ferr_args(
+                "tool-git-operations-error-clone-failed",
+                &[("error", &format!("{e}"))],
+            ))),
+        }
+    }
+
+    async fn git_pull(
+        &self,
+        args: serde_json::Value,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<ToolResult> {
+        let rebase = args
+            .get("rebase")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut git_args: Vec<String> = vec!["pull".into()];
+        if rebase {
+            git_args.push("--rebase".into());
+        }
+
+        if let Some(remote) = args.get("remote").and_then(|v| v.as_str()) {
+            match self.validate_remote_name(remote) {
+                Ok(remote) => git_args.push(remote.to_string()),
+                Err(e) => {
+                    return Ok(Self::result_failure(Self::ferr_args(
+                        "tool-git-operations-error-invalid-remote",
+                        &[("reason", &format!("{e}"))],
+                    )));
+                }
+            }
+        }
+        if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
+            match self.validate_revision(branch) {
+                Ok(branch) => git_args.push(branch.to_string()),
+                Err(e) => {
+                    return Ok(Self::result_failure(Self::ferr_args(
+                        "tool-git-operations-error-invalid-branch",
+                        &[("reason", &format!("{e}"))],
+                    )));
+                }
+            }
+        }
+
+        let git_args_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+        match self
+            .run_network_git_command(&git_args_refs, working_dir)
+            .await
+        {
+            Ok(output) => Ok(Self::result_success(output)),
+            Err(e) => Ok(Self::result_failure(Self::ferr_args(
+                "tool-git-operations-error-pull-failed",
+                &[("error", &format!("{e}"))],
+            ))),
+        }
+    }
+
+    async fn git_fetch(
+        &self,
+        args: serde_json::Value,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<ToolResult> {
+        let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let remote = args.get("remote").and_then(|v| v.as_str());
+
+        let mut git_args: Vec<String> = vec!["fetch".into()];
+        if all {
+            if remote.is_some() {
+                return Ok(Self::result_failure(Self::ferr(
+                    "tool-git-operations-error-fetch-combine",
+                )));
+            }
+            git_args.push("--all".into());
+        } else {
+            let remote = remote.unwrap_or("origin");
+            match self.validate_remote_name(remote) {
+                Ok(remote) => git_args.push(remote.to_string()),
+                Err(e) => {
+                    return Ok(Self::result_failure(Self::ferr_args(
+                        "tool-git-operations-error-invalid-remote",
+                        &[("reason", &format!("{e}"))],
+                    )));
+                }
+            }
+        }
+
+        let git_args_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+        match self
+            .run_network_git_command(&git_args_refs, working_dir)
+            .await
+        {
+            Ok(output) => Ok(Self::result_success(output)),
+            Err(e) => Ok(Self::result_failure(Self::ferr_args(
+                "tool-git-operations-error-fetch-failed",
+                &[("error", &format!("{e}"))],
+            ))),
+        }
+    }
+
+    async fn git_branch(
+        &self,
+        args: serde_json::Value,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<ToolResult> {
+        let remote_branches = args
+            .get("remote_branches")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let output = if remote_branches {
+            self.run_network_git_command(
+                &["branch", "-r", "--format=%(refname:short)"],
+                working_dir,
+            )
+            .await?
+        } else {
+            self.run_git_command(
                 &["branch", "--format=%(refname:short)|%(HEAD)"],
                 working_dir,
             )
-            .await?;
+            .await?
+        };
 
         let mut branches = Vec::new();
         let mut current = String::new();
 
         for line in output.lines() {
-            if let Some((name, head)) = line.split_once('|') {
+            if remote_branches {
+                if line.contains(" -> ") || line.trim().is_empty() {
+                    continue;
+                }
+                branches.push(json!({
+                    "name": line,
+                    "current": false
+                }));
+            } else if let Some((name, head)) = line.split_once('|') {
                 let is_current = head == "*";
                 if is_current {
                     current = name.to_string();
@@ -599,22 +1043,52 @@ impl GitOperationsTool {
         if branch_name.contains('@') || branch_name.contains('^') || branch_name.contains('~') {
             anyhow::bail!("Branch name contains invalid characters");
         }
+        self.validate_revision(branch_name)?;
 
-        let output = self
-            .run_git_command(&["checkout", branch_name], working_dir)
-            .await;
+        let create_branch = args
+            .get("create_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let track = args.get("track").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if track && !branch_name.contains('/') {
+            return Ok(Self::result_failure(Self::ferr(
+                "tool-git-operations-error-checkout-track",
+            )));
+        }
+
+        let mut git_args: Vec<&str> = vec!["checkout"];
+        if create_branch {
+            // For remote branches like "origin/feature", extract local name "feature".
+            let local_name = if branch_name.contains('/') {
+                branch_name.split('/').next_back().unwrap_or(branch_name)
+            } else {
+                branch_name
+            };
+            git_args.push("-b");
+            git_args.push(local_name);
+            if track {
+                git_args.push("--track");
+                git_args.push(branch_name);
+            } else if branch_name.contains('/') {
+                // Remote branch start point: create the local branch from the
+                // remote-tracking ref so it starts at the remote tip, not HEAD.
+                git_args.push(branch_name);
+            }
+        } else if track {
+            git_args.push("--track");
+            git_args.push(branch_name);
+        } else {
+            git_args.push(branch_name);
+        }
+
+        let output = self.run_git_command(&git_args, working_dir).await;
 
         match output {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                output: format!("Switched to branch: {branch_name}").into(),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Checkout failed: {e}")),
-            }),
+            Ok(_) => Ok(Self::result_success(format!(
+                "Switched to branch: {branch_name}"
+            ))),
+            Err(e) => Ok(Self::result_failure(format!("Checkout failed: {e}"))),
         }
     }
 
@@ -859,7 +1333,9 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        TOOL_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string(TOOL_DESCRIPTION_KEY))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -868,7 +1344,7 @@ impl Tool for GitOperationsTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "worktree"],
+                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "worktree", "clone", "pull", "fetch"],
                     "description": "Git operation to perform"
                 },
                 "subcommand": {
@@ -886,7 +1362,7 @@ impl Tool for GitOperationsTool {
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch name (for 'checkout' operation or 'worktree add' subcommand)"
+                    "description": "Branch name. For 'checkout' (optionally with create_branch/track) or 'worktree add'; also the upstream branch for 'pull'."
                 },
                 "worktree_path": {
                     "type": "string",
@@ -899,6 +1375,10 @@ impl Tool for GitOperationsTool {
                 "cached": {
                     "type": "boolean",
                     "description": "Show staged changes (for 'diff' operation)"
+                },
+                "commit": {
+                    "type": "string",
+                    "description": "Optional commit or revision to diff against (for 'diff' operation, e.g. 'HEAD~3' or 'HEAD~3..HEAD')"
                 },
                 "limit": {
                     "type": "integer",
@@ -921,9 +1401,45 @@ impl Tool for GitOperationsTool {
                     "type": "boolean",
                     "description": "For 'stash push': also stash untracked files (-u). Without this, `git stash push` only touches tracked files."
                 },
+                "url": {
+                    "type": "string",
+                    "description": "Repository URL to clone (for 'clone'). Must be an https:// URL to a globally routable host; embedded credentials are rejected."
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "Destination directory name for 'clone'. Defaults to the repository name derived from the URL."
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Optional shallow-clone depth (positive integer) for 'clone'."
+                },
+                "remote": {
+                    "type": "string",
+                    "description": "Remote name. For 'fetch' (default: 'origin') or 'pull' to fetch from a specific remote."
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "For 'fetch': fetch from all remotes (cannot be combined with 'remote')."
+                },
+                "rebase": {
+                    "type": "boolean",
+                    "description": "For 'pull': rebase instead of merge."
+                },
+                "remote_branches": {
+                    "type": "boolean",
+                    "description": "For 'branch': list remote-tracking branches instead of local branches. Run 'fetch' first to refresh remote refs."
+                },
+                "create_branch": {
+                    "type": "boolean",
+                    "description": "For 'checkout': create the branch (-b) before switching."
+                },
+                "track": {
+                    "type": "boolean",
+                    "description": "For 'checkout': set up upstream tracking. Requires a remote branch name like 'origin/main'."
+                },
                 "path": {
                     "type": "string",
-                    "description": "Optional subdirectory path within the workspace to run git operations in. Defaults to workspace root."
+                    "description": "Optional subdirectory path within the workspace to run git operations in. Defaults to workspace root. For 'clone', this is the parent directory the repository is cloned into."
                 }
             },
             "required": ["operation"]
@@ -954,8 +1470,9 @@ impl Tool for GitOperationsTool {
             }
         };
 
-        // Check if we're in a git repository
-        if !working_dir.join(".git").exists() {
+        // Check if we're in a git repository. Clone is the exception: it
+        // creates the repository, so it must run outside an existing worktree.
+        if operation != "clone" && !working_dir.join(".git").exists() {
             // Try to find .git in parent directories
             let mut current_dir = working_dir.as_path();
             let mut found_git = false;
@@ -1025,6 +1542,9 @@ impl Tool for GitOperationsTool {
             "checkout" => self.git_checkout(args, &working_dir).await,
             "stash" => self.git_stash(args, &working_dir).await,
             "worktree" => self.git_worktree(args, &working_dir).await,
+            "clone" => self.git_clone(args, &working_dir).await,
+            "pull" => self.git_pull(args, &working_dir).await,
+            "fetch" => self.git_fetch(args, &working_dir).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1218,11 +1738,14 @@ mod tests {
         assert!(tool.requires_write_access("checkout"));
         assert!(tool.requires_write_access("stash"));
         assert!(tool.requires_write_access("worktree"));
+        assert!(tool.requires_write_access("clone"));
+        assert!(tool.requires_write_access("pull"));
 
         assert!(!tool.requires_write_access("status"));
         assert!(!tool.requires_write_access("diff"));
         assert!(!tool.requires_write_access("log"));
         assert!(!tool.requires_write_access("branch"));
+        assert!(!tool.requires_write_access("fetch"));
     }
 
     #[test]
@@ -1234,11 +1757,14 @@ mod tests {
         assert!(tool.is_read_only("diff"));
         assert!(tool.is_read_only("log"));
         assert!(tool.is_read_only("branch"));
+        assert!(tool.is_read_only("fetch"));
 
         // worktree has write subcommands (add/remove), so it is not read-only
         assert!(!tool.is_read_only("worktree"));
         assert!(!tool.is_read_only("commit"));
         assert!(!tool.is_read_only("add"));
+        assert!(!tool.is_read_only("clone"));
+        assert!(!tool.is_read_only("pull"));
     }
 
     #[test]
@@ -1536,6 +2062,37 @@ mod tests {
             .unwrap();
     }
 
+    /// Run `git <args>` in `dir`, panicking on failure. Used to seed
+    /// repositories and remotes that the tool then operates on.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}\nbranches:\n{}\nhead: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["branch", "-a", "--verbose"])
+                    .current_dir(dir)
+                    .output()
+                    .map(|o| o.stdout)
+                    .unwrap_or_default()
+            ),
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .current_dir(dir)
+                    .output()
+                    .map(|o| o.stdout)
+                    .unwrap_or_default()
+            )
+        );
+    }
+
     #[tokio::test]
     async fn stash_push_default_stashes_staged_and_unstaged() {
         let tmp = TempDir::new().unwrap();
@@ -1769,6 +2326,613 @@ mod tests {
         assert!(
             error.contains("initialize") || error.contains("init"),
             "error should mention initializing a repository, got: {error}"
+        );
+    }
+
+    #[test]
+    fn remote_name_validation() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(tool.validate_remote_name("origin").is_ok());
+        assert!(tool.validate_remote_name("upstream-2").is_ok());
+        assert!(tool.validate_remote_name("").is_err());
+        assert!(tool.validate_remote_name("-origin").is_err());
+        assert!(tool.validate_remote_name("--upload-pack=evil").is_err());
+        assert!(tool.validate_remote_name("origin repo").is_err());
+        assert!(tool.validate_remote_name("o;rm -rf").is_err());
+    }
+
+    #[test]
+    fn revision_validation_rejects_option_injection() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(tool.validate_revision("HEAD").is_ok());
+        assert!(tool.validate_revision("main").is_ok());
+        assert!(tool.validate_revision("v1.2.3~1").is_ok());
+        assert!(tool.validate_revision("").is_err());
+        // A leading `-` would be parsed as a git option (e.g. `git diff --output=...`).
+        assert!(tool.validate_revision("-x").is_err());
+        assert!(tool.validate_revision("--output=/tmp/x").is_err());
+        assert!(tool.validate_revision("HEAD;rm -rf /").is_err());
+        assert!(tool.validate_revision("HEAD | cat").is_err());
+        assert!(tool.validate_revision("HEAD`id`").is_err());
+        assert!(tool.validate_revision("HEAD\nreset").is_err());
+    }
+
+    #[test]
+    fn destination_component_validation() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(tool.validate_destination_component("myproject").is_ok());
+        assert!(tool.validate_destination_component("repo-name_2").is_ok());
+        assert!(tool.validate_destination_component("").is_err());
+        assert!(tool.validate_destination_component(".").is_err());
+        assert!(tool.validate_destination_component("..").is_err());
+        assert!(tool.validate_destination_component("../escape").is_err());
+        assert!(tool.validate_destination_component("a/b").is_err());
+        assert!(tool.validate_destination_component("a\\b").is_err());
+        assert!(tool.validate_destination_component("/abs").is_err());
+        assert!(tool.validate_destination_component("~home").is_err());
+        assert!(tool.validate_destination_component("-flag").is_err());
+        assert!(tool.validate_destination_component(".hidden").is_err());
+        assert!(tool.validate_destination_component("has space").is_err());
+    }
+
+    #[test]
+    fn clone_url_validation() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(
+            tool.validate_clone_url("https://github.com/org/repo.git")
+                .is_ok()
+        );
+        assert!(
+            tool.validate_clone_url(" https://github.com/org/repo.git ")
+                .is_ok()
+        );
+        assert!(tool.validate_clone_url("").is_err());
+        assert!(tool.validate_clone_url("not a url").is_err());
+        assert!(tool.validate_clone_url("https://").is_err());
+        // Non-https schemes
+        assert!(
+            tool.validate_clone_url("http://example.com/repo.git")
+                .is_err()
+        );
+        assert!(
+            tool.validate_clone_url("git://example.com/repo.git")
+                .is_err()
+        );
+        assert!(tool.validate_clone_url("file:///etc/passwd").is_err());
+        assert!(
+            tool.validate_clone_url("ssh://git@example.com/repo.git")
+                .is_err()
+        );
+        // Embedded credentials
+        assert!(
+            tool.validate_clone_url("https://user:pass@example.com/repo.git")
+                .is_err()
+        );
+        assert!(
+            tool.validate_clone_url("https://token@example.com/repo.git")
+                .is_err()
+        );
+        // Local/private hosts (SSRF guard)
+        assert!(
+            tool.validate_clone_url("https://127.0.0.1/repo.git")
+                .is_err()
+        );
+        assert!(
+            tool.validate_clone_url("https://localhost/repo.git")
+                .is_err()
+        );
+        assert!(tool.validate_clone_url("https://[::1]/repo.git").is_err());
+        assert!(
+            tool.validate_clone_url("https://10.0.0.5/repo.git")
+                .is_err()
+        );
+        assert!(
+            tool.validate_clone_url("https://192.168.1.1/repo.git")
+                .is_err()
+        );
+        // Cloud metadata endpoints
+        assert!(
+            tool.validate_clone_url("https://169.254.169.254/latest/meta-data")
+                .is_err()
+        );
+        assert!(
+            tool.validate_clone_url("https://100.100.100.200/latest/meta-data")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn extract_destination_from_url_deduces_repo_name() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+        let _ = tool;
+
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com/org/my-repo.git"),
+            "my-repo"
+        );
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com/org/repo"),
+            "repo"
+        );
+        assert_eq!(
+            GitOperationsTool::extract_destination_from_url("https://github.com"),
+            "repo"
+        );
+    }
+
+    #[test]
+    fn resolve_clone_target_rejects_existing_destination() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+        std::fs::create_dir(tmp.path().join("exists")).unwrap();
+
+        assert!(tool.resolve_clone_target(None, "exists").is_err());
+        assert!(tool.resolve_clone_target(None, "fresh").is_ok());
+    }
+
+    #[test]
+    fn clone_destination_cannot_escape_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // Any component that could escape the workspace or smuggle a flag is
+        // rejected before path resolution, so resolve_clone_target cannot be
+        // reached with a dangerous destination.
+        for dest in [
+            "..",
+            "../escape",
+            ".",
+            "/abs",
+            "~",
+            "-flag",
+            "a/b",
+            ".hidden",
+            "has space",
+        ] {
+            assert!(
+                tool.validate_destination_component(dest).is_err(),
+                "should reject destination '{dest}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_is_write_gated_and_blocked_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({
+                "operation": "clone",
+                "url": "https://github.com/org/repo.git",
+                "destination": "repo"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "clone must be write-gated");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("blocked"),
+            "write gating should block clone, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_non_https_and_unsafe_hosts() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        for url in [
+            "git://github.com/org/repo.git",
+            "http://github.com/org/repo.git",
+            "file:///etc/passwd",
+            "ssh://git@github.com/org/repo.git",
+            "https://127.0.0.1/org/repo.git",
+            "https://localhost/org/repo.git",
+            "https://10.0.0.5/org/repo.git",
+            "https://169.254.169.254/latest/meta-data",
+            "https://user:pass@github.com/org/repo.git",
+            "https://token@github.com/org/repo.git",
+            "https://github.com/org/repo with space.git",
+        ] {
+            let result = tool
+                .execute(json!({
+                    "operation": "clone",
+                    "url": url,
+                    "destination": "repo"
+                }))
+                .await
+                .unwrap();
+            assert!(
+                !result.success,
+                "clone should reject URL {url} before touching the network"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_zero_depth() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({
+                "operation": "clone",
+                "url": "https://github.com/org/repo.git",
+                "destination": "repo",
+                "depth": 0
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "depth=0 must be rejected");
+    }
+
+    #[tokio::test]
+    async fn clone_works_at_network_command_boundary() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let tool = test_tool(tmp.path());
+        let dest = tmp.path().join("cloned");
+        let url = format!("file://{}", tmp.path().display());
+
+        // The tool-level `clone` refuses file:// URLs, so prove the scrubbed
+        // network command itself can clone: this is the boundary the real
+        // https clone would exercise.
+        let output = tool
+            .run_network_git_command(&["clone", &url, dest.to_str().unwrap()], tmp.path())
+            .await
+            .expect("scrubbed-env git clone should succeed");
+        assert!(
+            output.is_empty() || output.contains("Cloning"),
+            "unexpected clone output: {output}"
+        );
+        assert!(
+            dest.join(".git").exists(),
+            "clone should create the target repo"
+        );
+        assert!(
+            dest.join("README.md").exists(),
+            "clone should materialize files"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_git_ignores_ambient_git_config() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        let tool = test_tool(tmp.path());
+
+        let output = tool
+            .run_network_git_command(&["config", "--list", "--show-origin"], tmp.path())
+            .await
+            .unwrap();
+
+        // System/global gitconfig must be disabled (GIT_CONFIG_NOSYSTEM=1 and
+        // GIT_CONFIG_GLOBAL=/dev/null); only repo-local config and the injected
+        // `-c safe.directory` line may show up.
+        assert!(
+            !output.contains("global") && !output.contains("system"),
+            "network git must not read system/global config, got:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_and_remote_cannot_be_combined() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({"operation": "fetch", "all": true, "remote": "origin"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "fetch with both 'all' and 'remote' must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_is_not_blocked_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // No remote is configured, so git fails — but the read-only policy
+        // itself must not block a fetch.
+        let result = tool
+            .execute(json!({"operation": "fetch", "remote": "origin"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            !error.contains("read-only"),
+            "fetch must not be blocked by read-only mode, got: {error}"
+        );
+        assert!(
+            error.contains("origin"),
+            "fetch should have reached git and failed on the missing remote, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_invalid_remote_or_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({"operation": "pull", "remote": "-evil", "branch": "main"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "pull must reject a flag-shaped remote name"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("remote"),
+            "error should name the remote problem"
+        );
+
+        let result = tool
+            .execute(json!({"operation": "pull", "remote": "origin", "branch": "--output=/x"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "pull must reject option injection in branch"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("--output"),
+            "error should surface the injected branch value"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_pull_and_remote_branches_with_local_remote() {
+        let tmp = TempDir::new().unwrap();
+
+        // Bare remote hosted on the local filesystem (no real network needed).
+        // Default the remote HEAD to `master` so later `git clone` produces a
+        // local `master` branch that matches the branches we push.
+        let bare = tmp.path().join("remote.git");
+        std::fs::create_dir(&bare).unwrap();
+        git_init_no_sign(&bare, &["--bare", "-b", "master"]);
+
+        // Repo A: publishes the first commit.
+        let dev_a = tmp.path().join("dev-a");
+        std::fs::create_dir(&dev_a).unwrap();
+        git_init_no_sign(&dev_a, &["-b", "master"]);
+        std::fs::write(dev_a.join("file.txt"), "one").unwrap();
+        run_git(&dev_a, &["add", "."]);
+        run_git(&dev_a, &["commit", "-m", "first"]);
+        run_git(&dev_a, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run_git(&dev_a, &["push", "-u", "origin", "master"]);
+
+        // Repo B: advances the shared remote with a second commit. Clone does
+        // not inherit the no-sign/identity local config, so set it explicitly
+        // (mirrors git_init_no_sign) to avoid the developer's gpg signing.
+        let dev_b = tmp.path().join("dev-b");
+        std::process::Command::new("git")
+            .args(["clone", bare.to_str().unwrap(), dev_b.to_str().unwrap()])
+            .output()
+            .unwrap();
+        run_git(&dev_b, &["config", "user.email", "test@test.com"]);
+        run_git(&dev_b, &["config", "user.name", "Test"]);
+        run_git(&dev_b, &["config", "commit.gpgsign", "false"]);
+        run_git(&dev_b, &["config", "tag.gpgsign", "false"]);
+        std::fs::write(dev_b.join("file.txt"), "two").unwrap();
+        run_git(&dev_b, &["add", "."]);
+        run_git(&dev_b, &["commit", "-m", "second"]);
+        run_git(&dev_b, &["push", "-u", "origin", "master"]);
+
+        let tool = test_tool(&dev_a);
+
+        let result = tool.execute(json!({"operation": "fetch"})).await.unwrap();
+        assert!(result.success, "fetch failed: {:?}", result.error);
+
+        let result = tool
+            .execute(json!({"operation": "branch", "remote_branches": true}))
+            .await
+            .unwrap();
+        assert!(result.success, "remote branch listing failed");
+        assert!(
+            result.output.contains("origin/master"),
+            "expected origin/master after fetch, got: {}",
+            result.output
+        );
+
+        let result = tool.execute(json!({"operation": "pull"})).await.unwrap();
+        assert!(result.success, "pull failed: {:?}", result.error);
+
+        let file = std::fs::read_to_string(dev_a.join("file.txt")).unwrap();
+        assert_eq!(
+            file, "two",
+            "pull should fast-forward dev-a to the second commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_create_branch_and_track() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("remote.git");
+        std::fs::create_dir(&bare).unwrap();
+        git_init_no_sign(&bare, &["--bare"]);
+
+        // Seed the remote with branches that have no local counterparts yet.
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).unwrap();
+        git_init_no_sign(&seed, &["-b", "master"]);
+        std::fs::write(seed.join("f.txt"), "feature").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "seed"]);
+        run_git(&seed, &["branch", "feature"]);
+        run_git(&seed, &["branch", "topic"]);
+        run_git(&seed, &["branch", "extra"]);
+        run_git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run_git(
+            &seed,
+            &[
+                "push", "-u", "origin", "master", "feature", "topic", "extra",
+            ],
+        );
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_init_no_sign(&repo, &["-b", "master"]);
+        std::fs::write(repo.join("m.txt"), "master").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "master"]);
+        run_git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        let tool = test_tool(&repo);
+        let result = tool.execute(json!({"operation": "fetch"})).await.unwrap();
+        assert!(result.success, "fetch failed: {:?}", result.error);
+
+        // create_branch extracts the local name from the remote branch.
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "origin/feature",
+                "create_branch": true
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "checkout failed: {:?}", result.error);
+        let current_output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let current = String::from_utf8_lossy(&current_output.stdout);
+        assert_eq!(current.trim(), "feature");
+        assert!(
+            std::fs::read_to_string(repo.join("f.txt"))
+                .unwrap()
+                .contains("feature")
+        );
+
+        // create_branch + track also sets an upstream.
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "origin/topic",
+                "create_branch": true,
+                "track": true
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "checkout create+track failed: {:?}",
+            result.error
+        );
+        let topic_output = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "topic@{upstream}"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let upstream = String::from_utf8_lossy(&topic_output.stdout);
+        assert_eq!(upstream.trim(), "origin/topic");
+
+        // track without create also creates the local branch.
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "origin/extra",
+                "track": true
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "checkout track failed: {:?}", result.error);
+        let extra_output = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "extra@{upstream}"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let upstream = String::from_utf8_lossy(&extra_output.stdout);
+        assert_eq!(upstream.trim(), "origin/extra");
+    }
+
+    #[tokio::test]
+    async fn checkout_track_requires_remote_branch_name() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let tool = test_tool(tmp.path());
+
+        // track=true without a remote branch name fails fast (no network).
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "feature", "track": true}))
+            .await
+            .unwrap();
+        assert!(!result.success, "track without a remote branch must fail");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("track") && error.contains("origin"),
+            "error should explain track needs a remote branch, got: {error}"
+        );
+
+        // track=true with a nonexistent remote branch fails via git.
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "origin/missing",
+                "track": true
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "tracking a missing remote branch must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_accepts_commit_revision_and_rejects_option_injection() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        std::fs::write(tmp.path().join("feature.txt"), "feature").unwrap();
+        run_git(tmp.path(), &["add", "."]);
+        run_git(tmp.path(), &["commit", "-m", "second"]);
+
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({"operation": "diff", "commit": "HEAD~1"}))
+            .await
+            .unwrap();
+        assert!(result.success, "diff failed: {:?}", result.error);
+        assert!(
+            result.output.contains("feature.txt"),
+            "expected feature.txt in the diff, got: {}",
+            result.output
+        );
+
+        assert!(
+            tool.execute(json!({"operation": "diff", "commit": "--output=/etc/passwd"}))
+                .await
+                .is_err(),
+            "diff must reject option injection via the commit parameter"
         );
     }
 }

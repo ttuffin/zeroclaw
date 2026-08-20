@@ -90,8 +90,19 @@ tool-file-read = Read file contents with line numbers. Supports partial reading 
 
 tool-file-write = Write contents to a file in the workspace
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree, clone, pull, fetch). Provides parsed JSON output and integrates with security policy for autonomy controls. Clone requires an https:// URL to a globally routable host and runs with a scrubbed environment (no ambient git credentials or config). Use remote_branches=true after a fetch to list remote branches, and create_branch/track with checkout to switch to or create tracking branches.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-error-clone-missing-url = Missing 'url' parameter for the 'clone' operation.
+tool-git-operations-error-clone-url = Clone URL rejected: { $reason }.
+tool-git-operations-error-clone-destination = Invalid clone destination: { $reason }.
+tool-git-operations-error-clone-depth = 'depth' must be a positive integer.
+tool-git-operations-error-clone-failed = Clone failed: { $error }.
+tool-git-operations-error-invalid-remote = Invalid remote name: { $reason }.
+tool-git-operations-error-invalid-branch = Invalid branch: { $reason }.
+tool-git-operations-error-pull-failed = Pull failed: { $error }.
+tool-git-operations-error-fetch-combine = Cannot combine 'all' and 'remote' for the 'fetch' operation.
+tool-git-operations-error-fetch-failed = Fetch failed: { $error }.
+tool-git-operations-error-checkout-track = track=true requires a remote branch name (e.g., 'origin/main').
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
